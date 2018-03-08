@@ -934,4 +934,26 @@ enum {
 
 #define TCA_CBS_MAX (__TCA_CBS_MAX - 1)
 
+
+/* CBWFQ section */
+
+#define TC_CBWFQ_MAX_CLASSES    64
+
+/* Drop Policy. */
+enum {
+    TC_CBWFQ_DP_TD,     /* Tail Drop. */
+    TC_CBWFQ_DP_WRED    /* WRED. */
+}
+
+struct tc_cbwfq_qopt {
+    __u32 bandwidth;
+    __u32 weigth;
+    __u32 limit;
+    __u32 drop_policy;
+};
+
+struct tc_cbwfq_glob {
+    __u32 ncls;
+};
+
 #endif
