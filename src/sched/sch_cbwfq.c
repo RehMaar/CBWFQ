@@ -1,5 +1,5 @@
 /* TODO:
- * 1. Dynamic bands.			[ ]
+ * 1. Dynamic bands.			[+]
  * 2. Separate bands adding.	[ ]
  * 3. Classfull pq.			    [ ]
  * 4. Weighted *pq*.		    [ ]
@@ -17,8 +17,8 @@
 #include <net/pkt_cls.h>
 
 #define PRINT_ALERT(msg) printk(KERN_ALERT"cbwfq: %s: " msg, __FUNCTION__);
-#define PRINT_INFO(msg)  printk(KERN_ALERT"cbwfq: %s: " msg, __FUNCTION__);
-#define PRINT_INFO_ARGS(fmt, args...)  printk(KERN_ALERT"cbwfq: %s: " fmt, __FUNCTION__, ##args);
+#define PRINT_INFO(msg)  printk(KERN_INFO"cbwfq: %s: " msg, __FUNCTION__);
+#define PRINT_INFO_ARGS(fmt, args...)  printk(KERN_INFO"cbwfq: %s: " fmt, __FUNCTION__, ##args);
 
 struct cbwfq_class {
     struct Qdisc_class_common common;
@@ -37,10 +37,23 @@ struct cbwfq_sched_data {
 
 	/* Save old for validating. */
 	u8  prio2band[TC_PRIO_MAX+1];
-	struct Qdisc *queues[TCQ_PRIO_BANDS];
+	//struct Qdisc *queues[TCQ_PRIO_BANDS];
 };
 
 /* ---- Class support. ---- */
+static void print_classes(struct cbwfq_sched_data *q) {
+	struct cbwfq_class *it;
+	int i;
+
+	for (i = 0; i < q->clhash.hashsize; i++) {
+		hlist_for_each_entry(it, &q->clhash.hash[i], common.hnode) {
+			printk(KERN_ALERT" cbwfq: %s: classid: %d, prio %d, q %p", __FUNCTION__,
+                    it->common.classid, it->prio, it->queue
+                   );
+		}
+	}
+}
+
 /* Allocate cl outside. */
 static void cbwfq_add_class(struct Qdisc *sch, struct cbwfq_class *cl)
 {
@@ -50,6 +63,7 @@ static void cbwfq_add_class(struct Qdisc *sch, struct cbwfq_class *cl)
     //                              &pfifo_qdisc_ops, cl->common.classid);
     qdisc_class_hash_insert(&q->clhash, &cl->common);
 }
+
 /* But free cl inside. */
 static void cbwfq_destroy_class(struct Qdisc *sch, struct cbwfq_class *cl)
 {
@@ -70,19 +84,27 @@ static void cbwfq_destroy_class(struct Qdisc *sch, struct cbwfq_class *cl)
 static inline struct cbwfq_class *
 cbwfq_class_lookup(struct cbwfq_sched_data *q, u32 classid)
 {
-	struct Qdisc_class_common *clc;
+//	struct Qdisc_class_common *clc;
+	struct cbwfq_class *it;
+	int i;
 
     PRINT_INFO("called");
-	clc = qdisc_class_find(&q->clhash, classid);
-	if (clc == NULL) {
-    	PRINT_INFO("class is null");
-    	return NULL;
+	for (i = 0; i < q->clhash.hashsize; i++) {
+		hlist_for_each_entry(it, &q->clhash.hash[i], common.hnode) {
+			if (classid == it->common.classid)
+    			return it;
+		}
 	}
-    return container_of(clc, struct cbwfq_class, common);
+
+	// ATTENTION: classid must not be 0.
+//	clc = qdisc_class_find(&q->clhash, classid);
+//	if (clc == NULL)
+//    	return NULL;
+//    return container_of(clc, struct cbwfq_class, common);
 }
 
 /* Returns pointer to the class. */
-static unsigned long cbwfq_find2(struct Qdisc *sch, u32 classid)
+static unsigned long cbwfq_find(struct Qdisc *sch, u32 classid)
 {
 	struct cbwfq_sched_data *q = qdisc_priv(sch);
     PRINT_INFO("called");
@@ -130,16 +152,18 @@ cbwfq_classify(struct sk_buff *skb, struct Qdisc *sch, int *qerr)
 			/* band & TC_PRIO_MAX -- priority,
 			 * id -- band number. */
 			int id = q->prio2band[band & TC_PRIO_MAX];
-			struct Qdisc *t1 = q->queues[id];
-			struct cbwfq_class *t2 = cbwfq_class_lookup(q, id);
+			//struct Qdisc *t1 = q->queues[id];
+			struct cbwfq_class *cl = cbwfq_class_lookup(q, q->prio2band[band & TC_PRIO_MAX]);
+			if (cl) { PRINT_INFO_ARGS("class: classid -- %d, prio -- %d, id -- %d", cl->common.classid, cl->prio, id); }
+			else { PRINT_INFO_ARGS("class is zero, id: %d", id); }
+			return cl == NULL ? NULL : cl->queue;
 
-			if (t2 == NULL) {
-				PRINT_INFO("t2 is null");
-			} else if (t1 != t2->queue) {
-				PRINT_INFO_ARGS("t1(%p)(%d)(%d) != t2(%p)(%d)(%d)", t1, id, band & TC_PRIO_MAX, t2->queue, t2->common.classid, t2->prio);
-			}
-
-			return t1;
+			//if (t2 == NULL) {
+			//	PRINT_INFO("t2 is null");
+			//} else if (t1 != t2->queue) {
+			//	PRINT_INFO_ARGS("t1(%p)(%d)(%d) != t2(%p)(%d)(%d)", t1, id, band & TC_PRIO_MAX, t2->queue, t2->common.classid, t2->prio);
+			//}
+			//return t1;
 		}
 		band = res.classid;
 	}
@@ -148,17 +172,21 @@ cbwfq_classify(struct sk_buff *skb, struct Qdisc *sch, int *qerr)
 	if (band >= q->bands)
     	band = q->prio2band[0];
 
-    struct cbwfq_class *cl = cbwfq_class_lookup(q, band);
-    if (cl == NULL) {
-        PRINT_INFO("cl is null");
-    } if (q->queues[band] != cl->queue) {;
-		PRINT_INFO_ARGS("q->queues[band](%d) != cl->queue(%d)", band, cl->common.classid);
-    }
+    //struct cbwfq_class *cl = cbwfq_class_lookup(q, band);
+    //if (cl == NULL) {
+    //    PRINT_INFO("cl is null");
+    //} if (q->queues[band] != cl->queue) {;
+	//	PRINT_INFO_ARGS("q->queues[band](%d) != cl->queue(%d)", band, cl->common.classid);
+    //}
 //	if (band >= q->bands) {
 //		return q->queues[q->prio2band[0]];
 
 	PRINT_INFO("end");
-	return q->queues[band];
+	//return q->queues[band];
+	struct cbwfq_class *cl = cbwfq_class_lookup(q, band);
+	//if (cl) { PRINT_INFO_ARGS("class: classid -- %d, prio -- %d, id -- %d", cl->common.classid, cl->prio, band); }
+	//else { PRINT_INFO_ARGS("class is zero, id: %d", band); }
+	return cl == NULL ? NULL : cl->queue;
 }
 
 static int
@@ -169,6 +197,7 @@ cbwfq_enqueue(struct sk_buff *skb, struct Qdisc *sch, struct sk_buff **to_free)
 
     PRINT_INFO("called");
 	qdisc = cbwfq_classify(skb, sch, &ret);
+
 #ifdef CONFIG_NET_CLS_ACT
 	if (qdisc == NULL) {
 
@@ -183,7 +212,7 @@ cbwfq_enqueue(struct sk_buff *skb, struct Qdisc *sch, struct sk_buff **to_free)
 	if (ret == NET_XMIT_SUCCESS) {
 		qdisc_qstats_backlog_inc(sch, skb);
 		sch->q.qlen++;
-    	PRINT_INFO("end");
+    	PRINT_INFO("end success");
 		return NET_XMIT_SUCCESS;
 	}
 	if (net_xmit_drop_count(ret))
@@ -200,17 +229,20 @@ static struct sk_buff *cbwfq_peek(struct Qdisc *sch)
 	PRINT_INFO("begin");
 	for (prio = 0; prio < q->bands; prio++) {
 
-		struct Qdisc *qdisc = q->queues[prio];
-		struct cbwfq_class *cl = cbwfq_class_lookup(q, prio);
-		if (cl == NULL) {
-    		PRINT_INFO("cl is NULL");
-		} else if (qdisc != cl->queue) {;
-			PRINT_INFO_ARGS("qdisc(%d) != cl->queue(%d)", prio, cl->common.classid);
-		}
+		//struct Qdisc *qdisc = q->queues[prio];
+		//struct cbwfq_class *cl = cbwfq_class_lookup(q, prio);
+		//if (cl == NULL) {
+    	//	PRINT_INFO("cl is NULL");
+		//} else if (qdisc != cl->queue) {;
+		//	PRINT_INFO_ARGS("qdisc(%d) != cl->queue(%d)", prio, cl->common.classid);
+		//}
 
-		struct sk_buff *skb = qdisc->ops->peek(qdisc);
-		if (skb)
-			return skb;
+		struct cbwfq_class *cl = cbwfq_class_lookup(q, prio);
+		if (cl) {
+    		struct sk_buff *skb = cl->queue->ops->peek(cl->queue);
+    		if (skb)
+    			return skb;
+		}
 	}
 	PRINT_INFO("end");
 	return NULL;
@@ -222,35 +254,41 @@ static struct sk_buff *cbwfq_dequeue(struct Qdisc *sch)
 	int prio;
 	PRINT_INFO("begin");
 
+	//print_classes(q);
+
+
 	for (prio = 0; prio < q->bands; prio++) {
 
-		struct Qdisc *qdisc = q->queues[prio];
-		struct Qdisc *qdisc2 = q->queues[q->prio2band[prio]];
-		struct cbwfq_class *cl = cbwfq_class_lookup(q, prio);
-		struct cbwfq_class *cl2 = cbwfq_class_lookup(q, q->prio2band[prio]);
+		//struct Qdisc *qdisc = q->queues[prio];
+		//struct Qdisc *qdisc2 = q->queues[q->prio2band[prio]];
+		//struct cbwfq_class *cl = cbwfq_class_lookup(q, prio);
+		//struct cbwfq_class *cl2 = cbwfq_class_lookup(q, q->prio2band[prio]);
 
-		PRINT_INFO_ARGS("q->prio2band[prio(%d)] = %d", prio, q->prio2band[prio]);
-
-		if (cl != NULL) {
-			PRINT_INFO_ARGS("cl1: %p, id: %d, prio: %d", cl->queue, cl->common.classid, cl->prio);
-		}
-		if (cl2 != NULL) {
-			PRINT_INFO_ARGS("cl2: %p, id: %d, prio: %d", cl2->queue, cl2->common.classid, cl2->prio);
-		}
-		if (qdisc2 != NULL) {
-			PRINT_INFO_ARGS("qdisc2: %p", qdisc2);
-		}
-		if (qdisc != NULL) {
-			PRINT_INFO_ARGS("qdisc1: %p", qdisc);
-		}
+		//PRINT_INFO_ARGS("q->prio2band[prio(%d)] = %d", prio, q->prio2band[prio]);
+		//if (cl != NULL) {
+		//	PRINT_INFO_ARGS("cl1: %p, id: %d, prio: %d", cl->queue, cl->common.classid, cl->prio);
+		//}
+		//if (cl2 != NULL) {
+		//	PRINT_INFO_ARGS("cl2: %p, id: %d, prio: %d", cl2->queue, cl2->common.classid, cl2->prio);
+		//}
+		//if (qdisc2 != NULL) {
+		//	PRINT_INFO_ARGS("qdisc2: %p", qdisc2);
+		//}
+		//if (qdisc != NULL) {
+		//	PRINT_INFO_ARGS("qdisc1: %p", qdisc);
+		//}
 
 		//if (cl == NULL) {
 		//	PRINT_INFO("cl is null");
 		//} else if (qdisc != cl->queue) {;
 		//	PRINT_INFO_ARGS("qdisc(%p)(%d) != cl->queue(%p)(%d);", qdisc, prio, cl->queue, cl->common.classid);
 		//}
-		
-		struct sk_buff *skb = qdisc_dequeue_peeked(qdisc);
+
+		struct cbwfq_class *cl = cbwfq_class_lookup(q, prio);
+		if (cl == NULL)
+    		goto out;
+
+		struct sk_buff *skb = qdisc_dequeue_peeked(cl->queue);
 		if (skb) {
 			qdisc_bstats_update(sch, skb);
 			qdisc_qstats_backlog_dec(sch, skb);
@@ -259,6 +297,7 @@ static struct sk_buff *cbwfq_dequeue(struct Qdisc *sch)
 			return skb;
 		}
 	}
+out:
 	PRINT_INFO("end null");
 	return NULL;
 }
@@ -266,11 +305,20 @@ static struct sk_buff *cbwfq_dequeue(struct Qdisc *sch)
 static void
 cbwfq_reset(struct Qdisc *sch)
 {
-	int p;
+	int i;
 	struct cbwfq_sched_data *q = qdisc_priv(sch);
-
-	for (p = 0; p < q->bands; p++)
-		qdisc_reset(q->queues[p]);
+	struct cbwfq_class *it;
+	//for (p = 0; p < q->bands; p++) {
+	//	qdisc_reset(q->queues[p]);
+	//}
+	for (i = 0; i < q->clhash.hashsize; i++) {
+		hlist_for_each_entry(it, &q->clhash.hash[i], common.hnode) {
+			//printk(KERN_ALERT" cbwfq: %s: classid: %d, prio %d, q %p", __FUNCTION__,
+            //        it->common.classid, it->prio, it->queue
+            //);
+			qdisc_reset(it->queue);
+		}
+	}
 	sch->qstats.backlog = 0;
 	sch->q.qlen = 0;
 }
@@ -278,13 +326,21 @@ cbwfq_reset(struct Qdisc *sch)
 static void
 cbwfq_destroy(struct Qdisc *sch)
 {
-	int p;
+	int i;
 	struct cbwfq_sched_data *q = qdisc_priv(sch);
-
+	struct cbwfq_class *it;
     PRINT_INFO("called");
 	tcf_block_put(q->block);
-	for (p = 0; p < q->bands; p++)
-		qdisc_destroy(q->queues[p]);
+	//for (p = 0; p < q->bands; p++)
+	//	qdisc_destroy(q->queues[p]);
+	for (i = 0; i < q->clhash.hashsize; i++) {
+		hlist_for_each_entry(it, &q->clhash.hash[i], common.hnode) {
+			//printk(KERN_ALERT" cbwfq: %s: classid: %d, prio %d, q %p", __FUNCTION__,
+            //        it->common.classid, it->prio, it->queue
+            //);
+			qdisc_destroy(it->queue);
+		}
+	}
 }
 
 static int cbwfq_tune(struct Qdisc *sch, struct nlattr *opt)
@@ -334,18 +390,23 @@ static int cbwfq_tune(struct Qdisc *sch, struct nlattr *opt)
 
 	/* Destroy newly unused queues. */
 	for (i = q->bands; i < oldbands; i++) {
-		struct Qdisc *child = q->queues[i];
+		//struct Qdisc *child = q->queues[i];
 		struct cbwfq_class *cl = cbwfq_class_lookup(q, i);
-
-		if (cl->queue == child) {
-			/* All is okay, we could delete things. */
-			cbwfq_destroy_class(sch, cl);
-		} else {
-    		PRINT_INFO_ARGS("cl->queue(%d) != child(%d)", cl->common.classid, i);
-    		qdisc_tree_reduce_backlog(child, child->q.qlen,
-    					  child->qstats.backlog);
-    		qdisc_destroy(child);
+		if (cl) {
+    		qdisc_tree_reduce_backlog(cl->queue, cl->queue->q.qlen,
+    					  cl->queue->qstats.backlog);
+    		cbwfq_destroy_class(sch, cl);
 		}
+
+		//if (cl->queue == child) {
+		//	/* All is okay, we could delete things. */
+		//	cbwfq_destroy_class(sch, cl);
+		//} else {
+    	//	PRINT_INFO_ARGS("cl->queue(%d) != child(%d)", cl->common.classid, i);
+    	//	qdisc_tree_reduce_backlog(child, child->q.qlen,
+    	//				  child->qstats.backlog);
+    	//	qdisc_destroy(child);
+		//}
 	}
 
 	/*
@@ -357,29 +418,28 @@ static int cbwfq_tune(struct Qdisc *sch, struct nlattr *opt)
 	/* Add newly created. */
 	for (i = oldbands; i < q->bands; i++) {
 		struct cbwfq_class *cl = kmalloc( sizeof(struct cbwfq_class), GFP_KERNEL);
+		if (cl == NULL)
+    		return  -ENOMEM;
+
 		cl->common.classid = i;
 		cl->queue = queues[i];
 		cl->prio  = q->prio2band[i];
 		cbwfq_add_class(sch, cl);
 
-		q->queues[i] = queues[i];
-		/* Nothing panics without this lines. Maybe it just increase performance.*/
-		if (q->queues[i] != &noop_qdisc)
-			qdisc_hash_add(q->queues[i], true);
+		if (cl->queue != &noop_qdisc)
+			qdisc_hash_add(cl->queue, true);
+		//q->queues[i] = queues[i];
+		///* Nothing panics without this lines. Maybe it just increase performance.*/
+		//if (q->queues[i] != &noop_qdisc)
+		//	qdisc_hash_add(q->queues[i], true);
 	}
 
 //	for (i = 0; i < q->bands; i++) {
 //    	printk(KERN_ALERT" cbwfq: %s: i: %d, band: %d, q %p", __FUNCTION__,
 //               i, q->prio2band[i], q->queues[i]);
 //	}
-//	struct cbwfq_class *it;
-//	for (i = 0; i < q->clhash.hashsize; i++) {
-//		hlist_for_each_entry(it, &q->clhash.hash[i], common.hnode) {
-//			printk(KERN_ALERT" cbwfq: %s: itassid: %d, prio %d, q %p", __FUNCTION__,
-//                    it->common.classid, it->prio, it->queue
-//                   );
-//		}
-//	}
+
+	print_classes(q);
 	
 	sch_tree_unlock(sch);
 	PRINT_INFO("and all is okay!");
@@ -437,7 +497,11 @@ static int cbwfq_graft(struct Qdisc *sch, unsigned long arg, struct Qdisc *new,
 	if (new == NULL)
 		new = &noop_qdisc;
 
-	*old = qdisc_replace(sch, new, &q->queues[band]);
+	//*old = qdisc_replace(sch, new, &q->queues[band]);
+	struct cbwfq_class *cl = cbwfq_class_lookup(q, band);
+	if (cl) {
+    	*old = qdisc_replace(sch, new, &cl->queue);
+	}
 	return 0;
 }
 
@@ -446,13 +510,15 @@ cbwfq_leaf(struct Qdisc *sch, unsigned long arg)
 {
 	struct cbwfq_sched_data *q = qdisc_priv(sch);
 	unsigned long band = arg - 1;
+	struct cbwfq_class *cl = cbwfq_class_lookup(q, band);
 
     PRINT_INFO("called");
-	return q->queues[band];
+	//return q->queues[band];
+	return cl == NULL? NULL : cl->queue;
 }
 
 /* Returns number of band. */
-static unsigned long cbwfq_find(struct Qdisc *sch, u32 classid)
+static unsigned long cbwfq_find2(struct Qdisc *sch, u32 classid)
 {
 	struct cbwfq_sched_data *q = qdisc_priv(sch);
 	unsigned long band = TC_H_MIN(classid);
@@ -480,10 +546,13 @@ static int cbwfq_dump_class(struct Qdisc *sch, unsigned long cl, struct sk_buff 
 			   struct tcmsg *tcm)
 {
 	struct cbwfq_sched_data *q = qdisc_priv(sch);
-
+	struct cbwfq_class *c = cbwfq_class_lookup(q, cl - 1);
     PRINT_INFO("called");
+	
+    
 	tcm->tcm_handle |= TC_H_MIN(cl);
-	tcm->tcm_info = q->queues[cl-1]->handle;
+	//tcm->tcm_info = q->queues[cl-1]->handle;
+	tcm->tcm_info = c->queue->handle;
 	return 0;
 }
 
@@ -492,9 +561,12 @@ static int cbwfq_dump_class_stats(struct Qdisc *sch, unsigned long cl,
 {
 	struct cbwfq_sched_data *q = qdisc_priv(sch);
 	struct Qdisc *cl_q;
+	struct cbwfq_class *c = cbwfq_class_lookup(q, cl - 1);
 
     PRINT_INFO("called");
-	cl_q = q->queues[cl - 1];
+
+    cl_q = c->queue; 
+	//cl_q = q->queues[cl - 1];
 	if (gnet_stats_copy_basic(qdisc_root_sleeping_running(sch),
 				  d, NULL, &cl_q->bstats) < 0 ||
 	    gnet_stats_copy_queue(d, NULL, &cl_q->qstats, cl_q->q.qlen) < 0)
@@ -506,18 +578,18 @@ static int cbwfq_dump_class_stats(struct Qdisc *sch, unsigned long cl,
 static void cbwfq_walk(struct Qdisc *sch, struct qdisc_walker *arg)
 {
 	struct cbwfq_sched_data *q = qdisc_priv(sch);
-	int cbwfq;
+	int p;
 
     PRINT_INFO("called");
 	if (arg->stop)
 		return;
 
-	for (cbwfq = 0; cbwfq < q->bands; cbwfq++) {
+	for (p = 0; p < q->bands; p++) {
 		if (arg->count < arg->skip) {
 			arg->count++;
 			continue;
 		}
-		if (arg->fn(sch, cbwfq + 1, arg) < 0) {
+		if (arg->fn(sch, p + 1, arg) < 0) {
 			arg->stop = 1;
 			break;
 		}
