@@ -934,7 +934,7 @@ enum {
 
 #define TCA_CBS_MAX (__TCA_CBS_MAX - 1)
 
-
+#if 0
 /* CBWFQ section */
 
 #define TC_CBWFQ_MAX_CLASSES    64
@@ -945,6 +945,9 @@ enum {
     TC_CBWFQ_DP_WRED    /* WRED. */
 }
 
+/* States */
+
+
 struct tc_cbwfq_qopt {
     __u32 bandwidth;
     __u32 weigth;
@@ -954,6 +957,24 @@ struct tc_cbwfq_qopt {
 
 struct tc_cbwfq_glob {
     __u32 ncls;
+};
+#endif
+
+enum {
+    TCA_CBWFQ_UNSPEC,
+    TCA_CBWFQ_PARAMS,
+    TCA_CBWFQ_INIT,
+    __TCA_CBWFQ_MAX
+};
+#define TCA_CBWFQ_MAX (__TCA_CBWFQ_MAX - 1)
+
+struct tc_cbwfq_qopt {
+	int	bands;			/* Number of bands */
+	__u8	priomap[TC_PRIO_MAX+1];	/* Map: logical priority -> PRIO band */
+};
+
+struct tc_cbwfq_copt {
+    unsigned int prio;
 };
 
 #endif
