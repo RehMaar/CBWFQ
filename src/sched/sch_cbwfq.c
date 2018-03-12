@@ -132,23 +132,31 @@ static int
 cbwfq_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
                    struct nlattr **tca, unsigned long *arg)
 {
-	//struct cbwfq_sched_data *q = qdisc_priv(sch);
-	//struct cbwfq_class *cl = (struct cbwfq_class *)*arg;
+//	struct cbwfq_sched_data *q = qdisc_priv(sch);
+	struct cbwfq_class *cl;
 	struct nlattr *opt = tca[TCA_OPTIONS];
 	struct nlattr *tb[TCA_CBWFQ_MAX + 1];
 	struct tc_cbwfq_copt *copt;
 	int err = -EINVAL;
+	int cid_maj, cid_min, p_maj;
     
 	PRINT_INFO_ARGS("classid: %d, parentid: %d, arg: %d", classid, parentid, *arg);
 	PRINT_INFO_ARGS("classid: %d:%d, parentid: %d:%d", TC_H_MAJ(classid) >> 16, TC_H_MIN(classid),
                     TC_H_MAJ(parentid) >> 16, TC_H_MIN(parentid));
 
+	p_maj = TC_H_MAJ(parentid) >> 16;
+	cid_maj = TC_H_MAJ(classid) >> 16;
+
+	/* Both have to be 1, because there's no class heirarchy. */
+	if (p_maj != 1 || cid_maj != 1)
+		return -EINVAL;
+
+	cid_min = TC_H_MIN(classid);
+
 	if (opt == NULL) {
-		PRINT_INFO("No options.");
 		goto failure;
 	}
 
-	PRINT_INFO_ARGS("opt len: %d, type %d TCA_OPTIONS(%d)", opt->nla_len, opt->nla_type, TCA_OPTIONS);
 	err = nla_parse_nested(tb, TCA_CBWFQ_MAX, opt, cbwfq_policy, NULL);
 	if (err < 0) {
 		PRINT_INFO("couldn't parse policy");
@@ -160,9 +168,18 @@ cbwfq_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
     	PRINT_INFO("tb is NULL!");
 		goto failure;
 	}
+
 	PRINT_INFO("try to get copt!");
 	copt = nla_data(tb[TCA_CBWFQ_PARAMS]);
 	PRINT_INFO_ARGS("given from US prio value is: %d", copt->prio);
+	cl = kmalloc( sizeof(struct cbwfq_class), GFP_KERNEL);
+	if (cl == NULL)
+    	return  -ENOMEM;
+
+	cl->common.classid = cid_min;
+	cl->prio = copt->prio;
+
+	cbwfq_add_class(sch, cl);
 
 	return 0;
 failure:
