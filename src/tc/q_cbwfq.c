@@ -24,10 +24,10 @@
 
 static void explain(void)
 {
-    fprintf(stderr, "Usage: ... qdisc add .. cbwfq bandwidth B limit L "
+    fprintf(stderr, "Usage: ... qdisc add .. cbwfq bandwidth B "
                                                    "[default limit L]\n"
-            "\tbandwidth    total bandwidth in Mbps\n"
-            "\tlimit        maximum value of packets in the CBWFQ system\n"
+            "\tbandwidth       total bandwidth in Mbps\n"
+            "\tdefault limit   maximum value of packets in the default queue\n"
             "... class add ... cbwfq rate R [percent] [limit L]\n"
             "\trate R [percent]   rate for the class in bps (or in percents "
                                         "with ``percent'' keyword)\n"
@@ -70,12 +70,6 @@ static int cbwfq_parse_opt(struct qdisc_util *qu, int argc, char **argv,
                 return -1;
             }
             opt.cbwfq_gl_if_bandwidth *= 1000000;
-        } else if (matches(*argv, "limit") == 0) {
-            NEXT_ARG();
-            if (get_u32(&opt.cbwfq_gl_limit, *argv, 10)) {
-                explain1("limit");
-                return -1;
-            }
         } else {
             fprintf(stderr, "What is \"%s\"?\n", *argv);
             explain();
@@ -171,8 +165,7 @@ int cbwfq_print_opt(struct qdisc_util *qu, FILE *f, struct rtattr *opt)
     }
 
     if (qopt != NULL) {
-        fprintf(f, "total bandwidth %d limit %d ", qopt->cbwfq_gl_if_bandwidth,
-                                                   qopt->cbwfq_gl_limit);
+        fprintf(f, "total bandwidth %d ", qopt->cbwfq_gl_if_bandwidth);
     }
     return 0;
 }
@@ -196,7 +189,7 @@ static int cbwfq_print_copt(struct qdisc_util *qu, FILE *f, struct rtattr *opt)
 
     if (copt) {
         fprintf(f, "limit %d rate %d ", copt->cbwfq_cl_limit,
-                						copt->cbwfq_cl_rate);
+                                        copt->cbwfq_cl_rate);
     }
 
     return 0;
