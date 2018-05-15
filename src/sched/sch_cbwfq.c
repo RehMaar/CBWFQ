@@ -15,8 +15,6 @@
 #define PRINT_INFO_ARGS(fmt, args...)  printk(KERN_INFO"cbwfq: %s: " fmt, __FUNCTION__, ##args);
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
-#define NSEC_PER_SEC 1000000000
-
 /**
  * cbwfq_class -- class description
  * @common     Common qdisc data. Used in hash-table.
@@ -33,7 +31,7 @@ struct cbwfq_class {
     psched_time_t ft;
     psched_time_t prev_ft;
     u32 limit;
-    u32 rate;
+    u32 weight;
 };
 
 /**
@@ -57,12 +55,7 @@ struct cbwfq_sched_data {
 
     struct cbwfq_class *default_queue;
 
-	psched_time_t start;
-
-    u32 if_bandwidth;
-    u32 used_by_cl_rate;
-
-    u32 backlog;
+    s32 used_by_cl_weight;
 };
 
 
@@ -77,7 +70,7 @@ static void
 print_class(struct cbwfq_class *cl)
 {
     PRINT_INFO_ARGS("classid: %d, limit: %d, rate: %d, q.len: %d, ft: %lld",
-            cl->common.classid, cl->limit, cl->rate, cl->queue->q.qlen, cl->ft
+            cl->common.classid, cl->limit, cl->weight, cl->queue->q.qlen, cl->ft
     );
 }
 
@@ -178,6 +171,7 @@ cbwfq_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
         return -EINVAL;
 
     cid_min = TC_H_MIN(classid);
+
     // TODO: probably leak
     if (cbwfq_class_lookup(q, cid_min) != NULL) {
         PRINT_INFO("can't change class!");
@@ -213,24 +207,20 @@ cbwfq_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
         cl->limit = 1024;
     }
 
-    if (copt->cbwfq_cl_rate_type == CBWFQ_RF_BYTES) {
-        cl->rate = copt->cbwfq_cl_rate * 100 / q->if_bandwidth;
-    } else {
-        cl->rate = copt-> cbwfq_cl_rate; //(copt->cbwfq_cl_rate * q->if_bandwidth) / 100;
-    }
+	c->weight = copt->cbwfq_cl_weight;
+	if (q->used_by_cl_weight + c->weight > 100) {
+    	PRINT_INFO_ARGS("sum class weight must be less or equal to 100%; now: %d", q->used_by_cl_weight + c->weight);
+    	kfree(cl);
+		return -EINVAL;
+	}
+	q->used_by_cl_weight += c->weight;
+	q->default_queue->weight = 100 - q->used_by_cl_weight;
 
-    q->used_by_cl_rate += cl->rate;
-    if (q->used_by_cl_rate < 0) {
-        kfree(cl);
-        return -EINVAL;
-    }
-
-    q->default_queue->rate = 100 - q->used_by_cl_rate; //q->if_bandwidth - q->used_by_cl_rate;
     cbwfq_add_class(sch, cl);
 
     PRINT_INFO_ARGS("classid: %d:%d (%d), parentid: %d:%d\n", TC_H_MAJ(classid) >> 16, TC_H_MIN(classid), classid,
                     TC_H_MAJ(parentid) >> 16, TC_H_MIN(parentid));
-	PRINT_INFO_ARGS("Rate: %d\nLimit: %d\nDefault rate: %d\n", cl->rate, cl->limit, q->default_queue->rate);
+	PRINT_INFO_ARGS("Weight: %d\nLimit: %d\nDefault weight: %d\n", cl->weight, cl->limit, q->default_queue->weight);
 
 #ifdef PRINT_CALLS
     PRINT_INFO("end\n");
@@ -655,11 +645,7 @@ cbwfq_init(struct Qdisc *sch, struct nlattr *opt)
         cl->limit = qopt->cbwfq_gl_default_limit;
     }
 
-    q->used_by_cl_rate = 0;
-    //cl->rate = q->if_bandwidth = qopt->cbwfq_gl_if_bandwidth;
-    cl->rate = 100;
-
-    PRINT_INFO_ARGS("Rate: %d", qopt->cbwfq_gl_if_bandwidth);
+    PRINT_INFO_ARGS("Default weight: %d", qopt->cbwfq_gl_default_weight);
 
     q->backlog = 0;
 
@@ -670,6 +656,7 @@ cbwfq_init(struct Qdisc *sch, struct nlattr *opt)
     return 0;
 }
 
+#if 0
 static int
 cbwfq_dump(struct Qdisc *sch, struct sk_buff *skb)
 {
@@ -698,6 +685,7 @@ nla_put_failure:
     nlmsg_trim(skb, b);
     return -1;
 }
+#endif
 
 static int
 cbwfq_graft(struct Qdisc *sch, unsigned long arg, struct Qdisc *new,
@@ -774,8 +762,8 @@ cbwfq_dump_class(struct Qdisc *sch, unsigned long cl,
         goto failure;
 
     memset(&opt, 0, sizeof(opt));
-    opt.cbwfq_cl_limit = c->limit;
-    opt.cbwfq_cl_rate  = c->rate;
+    opt.cbwfq_cl_limit  = c->limit;
+    opt.cbwfq_cl_weight = c->weight;
 
     if (nla_put(skb, TCA_CBWFQ_PARAMS, sizeof(opt), &opt))
         goto failure;
@@ -895,7 +883,7 @@ static struct Qdisc_ops cbwfq_qdisc_ops __read_mostly = {
     /* Changes values of the parameters of a qdisc. */
     .change     =   cbwfq_change,
     /* Shows statistics of the queuing discipline. */
-    .dump       =   cbwfq_dump,
+    //.dump       =   cbwfq_dump,
     .owner      =   THIS_MODULE,
 };
 
