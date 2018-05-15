@@ -15,6 +15,8 @@
 #define PRINT_INFO_ARGS(fmt, args...)  printk(KERN_INFO"cbwfq: %s: " fmt, __FUNCTION__, ##args);
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
+#define FULL_WEIGHT 	100
+
 /**
  * cbwfq_class -- class description
  * @common     Common qdisc data. Used in hash-table.
@@ -207,14 +209,14 @@ cbwfq_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
         cl->limit = 1024;
     }
 
-	c->weight = copt->cbwfq_cl_weight;
-	if (q->used_by_cl_weight + c->weight > 100) {
-    	PRINT_INFO_ARGS("sum class weight must be less or equal to 100%; now: %d", q->used_by_cl_weight + c->weight);
+	cl->weight = copt->cbwfq_cl_weight;
+	if (q->used_by_cl_weight + cl->weight > FULL_WEIGHT) {
+    	PRINT_INFO_ARGS("sum class weight must be less or equal to 100%; now: %d", q->used_by_cl_weight + cl->weight);
     	kfree(cl);
 		return -EINVAL;
 	}
-	q->used_by_cl_weight += c->weight;
-	q->default_queue->weight = 100 - q->used_by_cl_weight;
+	q->used_by_cl_weight += cl->weight;
+	q->default_queue->weight = FULL_WEIGHT - q->used_by_cl_weight;
 
     cbwfq_add_class(sch, cl);
 
@@ -285,7 +287,7 @@ cbwfq_classify(struct sk_buff *skb, struct Qdisc *sch, int *qerr)
 }
 
 static u32
-eval_active_rate(struct cbwfq_sched_data *q)
+eval_active_weight(struct cbwfq_sched_data *q)
 {
     struct cbwfq_class *it;
     int i;
@@ -294,7 +296,7 @@ eval_active_rate(struct cbwfq_sched_data *q)
         hlist_for_each_entry(it, &q->clhash.hash[i], common.hnode) {
 			if (it->queue->q.qlen != 0) {
     			PRINT_INFO_ARGS("id: %d, len: %u", it->common.classid, it->queue->q.qlen);
-				r += it->rate;
+				r += it->weight;
 			}
         }
     }
@@ -302,8 +304,8 @@ eval_active_rate(struct cbwfq_sched_data *q)
 }
 
 static psched_time_t
-eval_virtual_time(psched_time_t t, u32 r, u32 tr) {
-	return (((t) * tr) / r);
+eval_virtual_time(psched_time_t t, u32 r) {
+	return (((t) * r) / FULL_WEIGHT);
 }
 
 /*
@@ -321,17 +323,14 @@ eval_finish_time(struct Qdisc *sch, struct cbwfq_class *cl,
 {
 	struct cbwfq_sched_data *q = qdisc_priv(sch);
     psched_time_t s = 0, t = 0;
-	u32 active_r = eval_active_rate(q);
+	u32 active_w = eval_active_weight(q);
 
-	//PRINT_INFO_ARGS("elems: %d, backlog: %d, backlog2: %d\n", q->clhash.hashelems, sch->qstats.backlog, q->backlog);
-	if (cl->queue->q.qlen != 0 && active_r != 0 /*&& cl->prev_ft != 0*/) { 
-    	psched_time_t a = eval_virtual_time(skb->tstamp, active_r, q->if_bandwidth);
+	if (cl->queue->q.qlen != 0 && active_w != 0 /*&& cl->prev_ft != 0*/) { 
+    	psched_time_t a = eval_virtual_time(skb->tstamp, active_w);
     	s = MAX(a, cl->prev_ft);
-    	PRINT_INFO_ARGS("ar: %u, a: %llu, pft: %llu\n", active_r, a, cl->prev_ft);
-    	//s = MAX((skb->tstamp /*+ PSCHED_NS2TICKS(skb->len)*/), cl->prev_ft);
+    	PRINT_INFO_ARGS("ar: %u, a: %llu, pft: %llu\n", active_w, a, cl->prev_ft);
 	}
-	//t = eval_virtual_time(PSCHED_NS2TICKS(skb->len << 3), cl->rate, q->if_bandwidth);
-	t = (qdisc_pkt_len(skb) * q->if_bandwidth) / cl->rate;
+	t = (qdisc_pkt_len(skb) * FULL_WEIGHT) / cl->weight;
 
 	PRINT_INFO_ARGS("cl: %ld, s: %llu, t: %llu; len: %u\n", cl->common.classid, s, t, qdisc_pkt_len(skb));
     return s + t;
@@ -374,7 +373,6 @@ cbwfq_enqueue(struct sk_buff *skb, struct Qdisc *sch, struct sk_buff **to_free)
         }
         sch->q.qlen++;
         qdisc_qstats_backlog_inc(sch, skb);
-		q->backlog++;
         return NET_XMIT_SUCCESS;
     }
 
@@ -488,7 +486,6 @@ cbwfq_dequeue(struct Qdisc *sch)
     qdisc_bstats_update(sch, skb);
     qdisc_qstats_backlog_dec(sch, skb);
     sch->q.qlen--;
-    q->backlog--;
 
     // Save final time and evaluate a new one.
     skb_next = cl->queue->ops->peek(cl->queue);
@@ -524,7 +521,6 @@ cbwfq_reset(struct Qdisc *sch)
     }
     sch->qstats.backlog = 0;
     sch->q.qlen = 0;
-    q->backlog = 0;
 }
 
 static void
@@ -580,11 +576,11 @@ cbwfq_change(struct Qdisc *sch, struct nlattr *opt)
     if (qopt->cbwfq_gl_default_limit > 0)
         q->default_queue->limit = qopt->cbwfq_gl_default_limit;
 
-    if (qopt->cbwfq_gl_if_bandwidth > 0)
-        q->if_bandwidth = qopt->cbwfq_gl_if_bandwidth;
+    if (qopt->cbwfq_gl_default_weight > 0)
+        q->default_queue->weight = qopt->cbwfq_gl_default_weight;
 
-	q->used_by_cl_rate = 0;
-	q->default_queue->rate = 100;
+	q->used_by_cl_weight = 0;
+	q->default_queue->weight = FULL_WEIGHT;
 
     sch_tree_unlock(sch);
 #ifdef PRINT_CALLS
@@ -631,8 +627,8 @@ cbwfq_init(struct Qdisc *sch, struct nlattr *opt)
     cl->common.classid = TC_H_MAKE(1 << 16, 1);
     cl->prev_ft = 0;
     cl->ft      = 0;
-    cl->rate    = 0;
     cl->limit   = 0;
+    cl->weight  = FULL_WEIGHT;
 
     err = nla_parse_nested(tb, TCA_CBWFQ_MAX, opt, cbwfq_policy, NULL);
     if (err < 0)
@@ -644,10 +640,11 @@ cbwfq_init(struct Qdisc *sch, struct nlattr *opt)
         PRINT_INFO_ARGS("Default queue limit: %d", qopt->cbwfq_gl_default_limit);
         cl->limit = qopt->cbwfq_gl_default_limit;
     }
+    if (qopt->cbwfq_gl_default_weight != 0) {
+        cl->weight = qopt->cbwfq_gl_default_weight;
+    }
 
-    PRINT_INFO_ARGS("Default weight: %d", qopt->cbwfq_gl_default_weight);
-
-    q->backlog = 0;
+    PRINT_INFO_ARGS("Default weight: %d", cl->weight);
 
     sch_tree_lock(sch);
     cbwfq_add_class(sch, cl);
