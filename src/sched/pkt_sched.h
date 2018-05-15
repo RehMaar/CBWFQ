@@ -959,10 +959,6 @@ struct tc_cbwfq_glob {
     __u32 ncls;
 };
 #endif
-enum rate_fmt {
-    CBWFQ_RF_BYTES,
-    CBWFQ_RF_RATE
-};
 
 enum {
     TCA_CBWFQ_UNSPEC,
@@ -973,15 +969,13 @@ enum {
 #define TCA_CBWFQ_MAX (__TCA_CBWFQ_MAX - 1)
 
 struct tc_cbwfq_glob {
-    __u32 cbwfq_gl_if_bandwidth;
     __u32 cbwfq_gl_default_limit;
-    __u32 cbwfq_gl_limit;
+    __u32 cbwfq_gl_default_weight;
 };
 
 struct tc_cbwfq_copt {
-    __u32 cbwfq_cl_rate;
+    __u32 cbwfq_cl_weight;
     __u32 cbwfq_cl_limit;
-    enum rate_fmt cbwfq_cl_rate_type;
 };
 
 #endif
