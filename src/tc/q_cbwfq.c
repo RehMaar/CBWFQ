@@ -24,13 +24,11 @@
 
 static void explain(void)
 {
-    fprintf(stderr, "Usage: ... qdisc add .. cbwfq bandwidth B "
-                                                   "[default limit L]\n"
-            "\tbandwidth       total bandwidth in Mbps\n"
-            "\tdefault limit   maximum value of packets in the default queue\n"
-            "... class add ... cbwfq rate R [percent] [limit L]\n"
-            "\trate R [percent]   rate for the class in bps (or in percents "
-                                        "with ``percent'' keyword)\n"
+    fprintf(stderr, "Usage: ... qdisc add .. cbwfq bandwidth B [default limit L rate R]\n"
+            "\tbandwidth 		  bandwidth of the link (in Kbps)\n"
+            "\tdefault            configuration for default class (see desciption below)\n"
+            "... class add ... cbwfq rate R [limit L]\n"
+            "\rate R [percent] 	  rate of the class in Kbit; to use percent and keywork `percent'\n"
             "\tlimit              max queue length (in packets)\n"
     );
 }
@@ -52,11 +50,37 @@ static int cbwfq_parse_opt(struct qdisc_util *qu, int argc, char **argv,
     while (argc > 0) {
         if (matches(*argv, "default") == 0) {
             NEXT_ARG();
+            fprintf(stderr, "%s\n", *argv);
             if (matches(*argv, "limit") == 0) {
                 NEXT_ARG();
                 if (get_u32(&opt.cbwfq_gl_default_limit, *argv, 10)) {
                     explain1("limit");
                     return -1;
+                }
+            }
+
+            argc--; argv++;
+            if (argc <= 0) {
+                    break;
+            } else if (matches(*argv, "rate") == 0) {
+				NEXT_ARG();
+                if (get_rate(&opt.cbwfq_gl_default_rate, *argv)) {
+                    explain1("rate");
+                    return -1;
+                }
+    			argv++; argc--;
+                if (argc <= 0) {
+                        break;
+                } else if (matches(*argv, "percent") == 0) {
+                    opt.cbwfq_gl_rate_type = TCA_CBWFQ_RT_PERCENT;
+					argv--;
+                    if (get_u32(&opt.cbwfq_gl_default_rate, *argv, 10)) {
+                        explain1("rate");
+                        return -1;
+                    }
+                    argv++;
+                } else {
+                    opt.cbwfq_gl_rate_type = TCA_CBWFQ_RT_BYTE;
                 }
             } else {
                 fprintf(stderr, "Unknown default parameter: \"%s\".\n", *argv);
@@ -64,12 +88,11 @@ static int cbwfq_parse_opt(struct qdisc_util *qu, int argc, char **argv,
                 return -1;
             }
         } else if (matches(*argv, "bandwidth") == 0) {
-            NEXT_ARG();
-            if (get_u32(&opt.cbwfq_gl_if_bandwidth, *argv, 10)) {
-                explain1("bandwidth");
-                return -1;
-            }
-            opt.cbwfq_gl_if_bandwidth *= 1000000;
+				NEXT_ARG();
+                if (get_rate(&opt.cbwfq_gl_total_rate, *argv)) {
+                    explain1("bandwidth");
+                    return -1;
+                }
         } else {
             fprintf(stderr, "What is \"%s\"?\n", *argv);
             explain();
@@ -78,12 +101,16 @@ static int cbwfq_parse_opt(struct qdisc_util *qu, int argc, char **argv,
         argc--; argv++;
     }
 
-    if (opt.cbwfq_gl_if_bandwidth <= 0) {
-        fprintf(stderr, "Bandwidth must be set in Mbps.");
-        explain();
-        return -1;
-    }
+	if (opt.cbwfq_gl_total_rate <= 0) {
+		fprintf(stderr, "Bandwidth must be set");
+		return -1;
+	}
 
+	fprintf(stderr, "rate: %u, default limit: %u, rate: %u\n",
+            opt.cbwfq_gl_total_rate, opt.cbwfq_gl_default_limit,
+            opt.cbwfq_gl_default_rate);
+
+	return -1;
     tail = NLMSG_TAIL(n);
     addattr_l(n, 1024, TCA_OPTIONS, NULL, 0);
     addattr_l(n, 2024, TCA_CBWFQ_INIT, &opt, NLMSG_ALIGN(sizeof(opt)));
@@ -101,18 +128,26 @@ static int cbwfq_parse_class_opt(struct qdisc_util *qu, int argc, char **argv,
     while (argc > 0) {
         if (matches(*argv, "rate") == 0) {
             NEXT_ARG();
-            if (get_u32(&opt.cbwfq_cl_rate, *argv, 10)) {
+            opt.cbwfq_cl_rate_type = TCA_CBWFQ_RT_BYTE;
+            if (get_rate(&opt.cbwfq_cl_rate, *argv)) {
                 explain1("rate");
                 return -1;
             }
-            /* Check optional parameter. */
-            argv++; argc--;
+			argv++; argc--;
             if (argc <= 0) {
-                break;
+                    break;
             } else if (matches(*argv, "percent") == 0) {
-                opt.cbwfq_cl_rate_type = CBWFQ_RF_RATE;
+                opt.cbwfq_cl_rate_type = TCA_CBWFQ_RT_PERCENT;
+                argv--;
+                if (get_u32(&opt.cbwfq_cl_rate, *argv, 10)) {
+                    explain1("rate");
+                    return -1;
+                }
+                argv++;
             } else {
-                opt.cbwfq_cl_rate_type = CBWFQ_RF_BYTES;
+                fprintf(stderr, "What is \"%s\"?\n", *argv);
+                explain();
+                return -1;
             }
         } else if (matches(*argv, "limit") == 0) {
             NEXT_ARG();
@@ -134,6 +169,8 @@ static int cbwfq_parse_class_opt(struct qdisc_util *qu, int argc, char **argv,
         return -1;
     }
 
+	fprintf(stderr, "limit: %u rate %u", opt.cbwfq_cl_limit,  opt.cbwfq_cl_rate);
+	return -1;
     tail = NLMSG_TAIL(n);
     addattr_l(n, 1024, TCA_OPTIONS, NULL, 0);
     addattr_l(n, 1024, TCA_CBWFQ_PARAMS, &opt, sizeof(opt));
@@ -165,10 +202,11 @@ int cbwfq_print_opt(struct qdisc_util *qu, FILE *f, struct rtattr *opt)
     }
 
     if (qopt != NULL) {
-        fprintf(f, "total bandwidth %d ", qopt->cbwfq_gl_if_bandwidth);
+        fprintf(f, "total rate %d ", qopt->cbwfq_gl_total_rate);
     }
     return 0;
 }
+
 static int cbwfq_print_copt(struct qdisc_util *qu, FILE *f, struct rtattr *opt)
 {
     struct rtattr *tb[TCA_CBWFQ_MAX+1];
