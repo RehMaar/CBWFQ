@@ -28,7 +28,7 @@ static void explain(void)
             "\tbandwidth 		  bandwidth of the link (in Kbps)\n"
             "\tdefault            configuration for default class (see desciption below)\n"
             "... class add ... cbwfq rate R [limit L]\n"
-            "\rate R [percent] 	  rate of the class in Kbit; to use percent and keywork `percent'\n"
+            "\trate R [percent] 	  rate of the class in Kbit; to use percent and keywork `percent'\n"
             "\tlimit              max queue length (in packets)\n"
     );
 }
@@ -50,16 +50,15 @@ static int cbwfq_parse_opt(struct qdisc_util *qu, int argc, char **argv,
     while (argc > 0) {
         if (matches(*argv, "default") == 0) {
             NEXT_ARG();
-            fprintf(stderr, "%s\n", *argv);
             if (matches(*argv, "limit") == 0) {
                 NEXT_ARG();
                 if (get_u32(&opt.cbwfq_gl_default_limit, *argv, 10)) {
                     explain1("limit");
                     return -1;
                 }
+                argc--; argv++;
             }
 
-            argc--; argv++;
             if (argc <= 0) {
                     break;
             } else if (matches(*argv, "rate") == 0) {
@@ -75,7 +74,7 @@ static int cbwfq_parse_opt(struct qdisc_util *qu, int argc, char **argv,
                     opt.cbwfq_gl_rate_type = TCA_CBWFQ_RT_PERCENT;
 					argv--;
                     if (get_u32(&opt.cbwfq_gl_default_rate, *argv, 10)) {
-                        explain1("rate");
+                        explain1("rate in percent");
                         return -1;
                     }
                     argv++;
@@ -106,11 +105,11 @@ static int cbwfq_parse_opt(struct qdisc_util *qu, int argc, char **argv,
 		return -1;
 	}
 
-	fprintf(stderr, "rate: %u, default limit: %u, rate: %u\n",
-            opt.cbwfq_gl_total_rate, opt.cbwfq_gl_default_limit,
-            opt.cbwfq_gl_default_rate);
+	if (opt.cbwfq_gl_default_rate <= 0) {
+		fprintf(stderr, "Default rate must be set");
+		return -1;
+	}
 
-	return -1;
     tail = NLMSG_TAIL(n);
     addattr_l(n, 1024, TCA_OPTIONS, NULL, 0);
     addattr_l(n, 2024, TCA_CBWFQ_INIT, &opt, NLMSG_ALIGN(sizeof(opt)));
@@ -133,6 +132,7 @@ static int cbwfq_parse_class_opt(struct qdisc_util *qu, int argc, char **argv,
                 explain1("rate");
                 return -1;
             }
+
 			argv++; argc--;
             if (argc <= 0) {
                     break;
@@ -169,8 +169,6 @@ static int cbwfq_parse_class_opt(struct qdisc_util *qu, int argc, char **argv,
         return -1;
     }
 
-	fprintf(stderr, "limit: %u rate %u", opt.cbwfq_cl_limit,  opt.cbwfq_cl_rate);
-	return -1;
     tail = NLMSG_TAIL(n);
     addattr_l(n, 1024, TCA_OPTIONS, NULL, 0);
     addattr_l(n, 1024, TCA_CBWFQ_PARAMS, &opt, sizeof(opt));
