@@ -9,13 +9,15 @@
 #include <net/pkt_sched.h>
 #include <net/pkt_cls.h>
 
+#include <linux/list.h>
+
 //define PRINT_CALLS
 #define PRINT_ALERT(msg) printk(KERN_ALERT"cbwfq: %s: " msg, __FUNCTION__);
 #define PRINT_INFO(msg)  printk(KERN_INFO"cbwfq: %s: " msg, __FUNCTION__);
 #define PRINT_INFO_ARGS(fmt, args...)  printk(KERN_INFO"cbwfq: %s: " fmt, __FUNCTION__, ##args);
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
-#define FULL_WEIGHT 	100
+#define DEFAULT_CL_ID    65537 
 
 /**
  * cbwfq_class -- class description
@@ -23,17 +25,19 @@
  * @queue      Class queue.
  * @ft         Finish time of the first packet in the queue.
  * @prev_ft    Finish time of the previous packet (that is already sent).
- * @limit      Limit for amount of packets in the queue.
- * @rate	   Allocated rate for the queue.
+ * 
  */
 struct cbwfq_class {
     struct Qdisc_class_common common;
     struct Qdisc *queue;
 
-    psched_time_t ft;
-    psched_time_t prev_ft;
-    u32 limit;
-    u32 weight;
+    u64 limit;
+    u64 rate;
+
+	u64 cl_sn;
+
+
+    bool is_active;
 };
 
 /**
@@ -57,7 +61,11 @@ struct cbwfq_sched_data {
 
     struct cbwfq_class *default_queue;
 
-    s32 used_by_cl_weight;
+	u64 ifrate;
+
+	u32 active_rate;
+
+    u64 sch_sn;
 };
 
 
@@ -67,27 +75,6 @@ static const struct nla_policy cbwfq_policy[TCA_CBWFQ_MAX + 1] = {
     [TCA_CBWFQ_INIT]    = { .len = sizeof(struct tc_cbwfq_glob) },
 };
 
-/* ---- Class support. ---- */
-static void
-print_class(struct cbwfq_class *cl)
-{
-    PRINT_INFO_ARGS("classid: %d, limit: %d, rate: %d, q.len: %d, ft: %lld",
-            cl->common.classid, cl->limit, cl->weight, cl->queue->q.qlen, cl->ft
-    );
-}
-
-/* Just print classes and their fields. */
-static void
-print_classes(struct cbwfq_sched_data *q) {
-    struct cbwfq_class *it;
-    int i;
-
-    for (i = 0; i < q->clhash.hashsize; i++) {
-        hlist_for_each_entry(it, &q->clhash.hash[i], common.hnode) {
-            print_class(it);
-        }
-    }
-}
 
 /**
  * Add class to the hash table.
@@ -118,9 +105,14 @@ cbwfq_destroy_class(struct Qdisc *sch, struct cbwfq_class *cl)
 #ifdef PRINT_CALLS
     PRINT_INFO("called");
 #endif
+
+    sch_tree_lock(sch);
+
     qdisc_tree_reduce_backlog(cl->queue, cl->queue->q.qlen,
                       cl->queue->qstats.backlog);
     qdisc_class_hash_remove(&q->clhash, &cl->common);
+
+    sch_tree_unlock(sch);
 
     if (cl->queue) {
         qdisc_destroy(cl->queue);
@@ -154,6 +146,59 @@ cbwfq_find(struct Qdisc *sch, u32 classid)
 }
 
 static int
+cbwfq_modify_class(struct Qdisc *sch, struct cbwfq_class *cl,
+                   struct tc_cbwfq_copt *copt)
+{
+    struct cbwfq_sched_data *q = qdisc_priv(sch);
+
+    if (copt->cbwfq_cl_limit > 0) {
+        cl->limit = copt->cbwfq_cl_limit;
+    }
+
+	if (copt->cbwfq_cl_rate_type == TCA_CBWFQ_RT_BYTE) {
+        cl->rate  = copt->cbwfq_cl_rate;
+	} else {
+        cl->rate  = copt->cbwfq_cl_rate * q->ifrate;
+        do_div(cl->rate, 100);
+	}
+
+    return 0;
+}
+
+static int
+cbwfq_class_create(struct Qdisc *sch, struct tc_cbwfq_copt *copt, unsigned long classid)
+{
+    struct cbwfq_class *cl;
+    struct cbwfq_sched_data *q = qdisc_priv(sch);
+
+    cl = kmalloc( sizeof(struct cbwfq_class), GFP_KERNEL);
+    if (cl == NULL)
+        return  -ENOMEM;
+
+
+    cl->common.classid = classid;
+    cl->limit   = 1024;
+    cl->rate  = 0;
+    cl->is_active = false;
+	cl->cl_sn = 0;
+
+    if (cbwfq_modify_class(sch, cl, copt) != 0) {
+        kfree(cl);
+        return -EINVAL;
+    }
+
+    sch_tree_lock(sch);
+        cbwfq_add_class(sch, cl);
+    sch_tree_unlock(sch);
+
+    PRINT_INFO_ARGS("classid: %ld:%ld (%ld)\n", TC_H_MAJ(classid) >> 16,
+                    TC_H_MIN(classid), classid);
+    PRINT_INFO_ARGS("Weight: %d Limit: %d Default rate: %d\n", cl->rate,
+                    cl->limit, q->default_queue->rate);
+    return 0;
+}
+
+static int
 cbwfq_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
                    struct nlattr **tca, unsigned long *arg)
 {
@@ -162,78 +207,47 @@ cbwfq_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
     struct nlattr *opt = tca[TCA_OPTIONS];
     struct nlattr *tb[TCA_CBWFQ_MAX + 1];
     struct tc_cbwfq_copt *copt;
-    int err = -EINVAL;
-    int cid_maj, cid_min, p_maj;
-    
-    p_maj = TC_H_MAJ(parentid) >> 16;
-    cid_maj = TC_H_MAJ(classid) >> 16;
+    int err;
+    int p_maj   = TC_H_MAJ(parentid) >> 16;
+    int cid_maj = TC_H_MAJ(classid) >> 16;
 
     /* Both have to be 1, because there's no class heirarchy. */
     if (p_maj != 1 || cid_maj != 1)
         return -EINVAL;
 
-    cid_min = TC_H_MIN(classid);
-
-    // TODO: probably leak
-    if (cbwfq_class_lookup(q, cid_min) != NULL) {
-        PRINT_INFO("can't change class!");
-        return -EEXIST;
-    }
-
     if (opt == NULL) {
-        goto failure;
+        return -EINVAL;
     }
 
     err = nla_parse_nested(tb, TCA_CBWFQ_MAX, opt, cbwfq_policy, NULL);
     if (err < 0) {
-        goto failure;
+        return err;
     }
 
-    err = -EINVAL;
     if (tb[TCA_CBWFQ_PARAMS] == NULL) {
-        goto failure;
+        return -EINVAL;
     }
-
     copt = nla_data(tb[TCA_CBWFQ_PARAMS]);
-    cl = kmalloc( sizeof(struct cbwfq_class), GFP_KERNEL);
-    if (cl == NULL)
-        return  -ENOMEM;
 
-    cl->ft             = 0;
-    cl->prev_ft        = 0;
-    cl->common.classid = classid;
+    cl = cbwfq_class_lookup(q, classid);
+    if (cl != NULL) {
+        return cbwfq_modify_class(sch, cl, copt);
+    }
+    return cbwfq_class_create(sch, copt, classid);
+}
 
-    if (copt->cbwfq_cl_limit != 0) {
-        cl->limit = copt->cbwfq_cl_limit;
-    } else {
-        cl->limit = 1024;
+
+static int
+cbwfq_delete_class(struct Qdisc *sch, unsigned long arg)
+{
+    struct cbwfq_class *cl = (struct cbwfq_class *)arg;
+
+    if (cl == NULL || cl->common.classid == DEFAULT_CL_ID) {
+        return -EINVAL;
     }
 
-	cl->weight = copt->cbwfq_cl_weight;
-	if (q->used_by_cl_weight + cl->weight > FULL_WEIGHT) {
-    	PRINT_INFO_ARGS("sum class weight must be less or equal to 100%; now: %d", q->used_by_cl_weight + cl->weight);
-    	kfree(cl);
-		return -EINVAL;
-	}
-	q->used_by_cl_weight += cl->weight;
-	q->default_queue->weight = FULL_WEIGHT - q->used_by_cl_weight;
-
-    cbwfq_add_class(sch, cl);
-
-    PRINT_INFO_ARGS("classid: %d:%d (%d), parentid: %d:%d\n", TC_H_MAJ(classid) >> 16, TC_H_MIN(classid), classid,
-                    TC_H_MAJ(parentid) >> 16, TC_H_MIN(parentid));
-	PRINT_INFO_ARGS("Weight: %d\nLimit: %d\nDefault weight: %d\n", cl->weight, cl->limit, q->default_queue->weight);
-
-#ifdef PRINT_CALLS
-    PRINT_INFO("end\n");
-#endif
+    cbwfq_destroy_class(sch, cl);
     return 0;
-
-failure:
-#ifdef PRINT_CALLS
-    PRINT_INFO("fail end\n");
-#endif
-    return err;
 }
 
 /* --- Main qdisc support --- */
@@ -285,57 +299,7 @@ cbwfq_classify(struct sk_buff *skb, struct Qdisc *sch, int *qerr)
 
     return cl;
 }
-
-static u32
-eval_active_weight(struct cbwfq_sched_data *q)
-{
-    struct cbwfq_class *it;
-    int i;
-	u32 r = 0;
-    for (i = 0; i < q->clhash.hashsize; i++) {
-        hlist_for_each_entry(it, &q->clhash.hash[i], common.hnode) {
-			if (it->queue->q.qlen != 0) {
-    			PRINT_INFO_ARGS("id: %d, len: %u", it->common.classid, it->queue->q.qlen);
-				r += it->weight;
-			}
-        }
-    }
-    return r;
-}
-
-static psched_time_t
-eval_virtual_time(psched_time_t t, u32 r) {
-	return (((t) * r) / FULL_WEIGHT);
-}
-
-/*
- * sch->if_bandwidth in bps
- * cl->rate          in bps
- * skb->len          in bytes (need to bits)
- * skb->tstamp       in tiks  (need to secs)
- * 
- * len(bits) / w  = virtual length
- * w = rate / bandwidth => len * bandwidth / rate
- */
-static psched_time_t
-eval_finish_time(struct Qdisc *sch, struct cbwfq_class *cl,
-                 struct sk_buff *skb) 
-{
-	struct cbwfq_sched_data *q = qdisc_priv(sch);
-    psched_time_t s = 0, t = 0;
-	u32 active_w = eval_active_weight(q);
-
-	if (cl->queue->q.qlen != 0 && active_w != 0 /*&& cl->prev_ft != 0*/) { 
-    	psched_time_t a = eval_virtual_time(skb->tstamp, active_w);
-    	s = MAX(a, cl->prev_ft);
-    	PRINT_INFO_ARGS("ar: %u, a: %llu, pft: %llu\n", active_w, a, cl->prev_ft);
-	}
-	t = (qdisc_pkt_len(skb) * FULL_WEIGHT) / cl->weight;
-
-	PRINT_INFO_ARGS("cl: %ld, s: %llu, t: %llu; len: %u\n", cl->common.classid, s, t, qdisc_pkt_len(skb));
-    return s + t;
-}
-
+   
 static int
 cbwfq_enqueue(struct sk_buff *skb, struct Qdisc *sch, struct sk_buff **to_free)
 {
@@ -344,12 +308,6 @@ cbwfq_enqueue(struct sk_buff *skb, struct Qdisc *sch, struct sk_buff **to_free)
     struct Qdisc *qdisc;
     int ret;
 
-#ifdef PRINT_CALLS
-    PRINT_INFO("called");
-#endif
-    if (skb->tstamp == 0)
-        skb->tstamp = ktime_get_real();
-    
     cl = cbwfq_classify(skb, sch, &ret);
     if (cl == NULL || cl->queue == NULL) {
         if (ret & __NET_XMIT_BYPASS)
@@ -358,122 +316,104 @@ cbwfq_enqueue(struct sk_buff *skb, struct Qdisc *sch, struct sk_buff **to_free)
         return ret;
     }
 
-	if (cl->queue->q.qlen >= cl->limit) {
+    if (cl->queue->q.qlen >= cl->limit) {
         if (net_xmit_drop_count(ret)) {
             qdisc_qstats_drop(sch);
         }
         return qdisc_drop(skb, sch, to_free);
-	}
+    }
 
     qdisc = cl->queue;
     ret = qdisc_enqueue(skb, qdisc, to_free);
     if (ret == NET_XMIT_SUCCESS) {
-        if (cl->ft == 0) {
-            cl->ft = eval_finish_time(sch, cl, skb);
+       u32 virtual_len = qdisc_pkt_len(skb) * q->ifrate;
+       do_div(virtual_len, cl->rate);
+        if (!cl->is_active) {
+           cl->cl_sn = skb->tstamp = q->sch_sn + virtual_len;
+           cl->is_active    = true;
+           q->active_rate += cl->rate;
+        } else {
+            cl->cl_sn += virtual_len; //qdisc_pkt_len(skb) * q->ifrate / cl->rate;
+			skb->tstamp = cl->cl_sn;
         }
+
+		PRINT_INFO_ARGS("%llu to %u\n", skb->tstamp, cl->common.classid);
+
+        /* Evaluate Finish time for each packet at arrival. */
         sch->q.qlen++;
         qdisc_qstats_backlog_inc(sch, skb);
+        qdisc_qstats_backlog_inc(cl->queue, skb);
         return NET_XMIT_SUCCESS;
     }
 
     if (net_xmit_drop_count(ret)) {
         qdisc_qstats_drop(sch);
+        qdisc_qstats_drop(cl->queue);
     }
 
-#ifdef PRINT_CALLS
-    PRINT_INFO("end\n");
-#endif
     return ret;
 }
 
-static struct sk_buff *
-cbwfq_peek(struct Qdisc *sch)
+static struct cbwfq_class *
+cbwfq_find_min(struct cbwfq_sched_data *q)
 {
-    struct cbwfq_sched_data *q = qdisc_priv(sch);
     struct cbwfq_class *it, *cl = NULL;
-    int i;
     ktime_t ft = KTIME_MAX;
-
-#ifdef PRINT_CALLS
-    PRINT_INFO("begin");
-#endif
+    int i;
 
     // Find class with min finish time. 
     for (i = 0; i < q->clhash.hashsize; i++) {
         hlist_for_each_entry(it, &q->clhash.hash[i], common.hnode) {
 #ifdef PRINT_CALLS
-            PRINT_INFO_ARGS("class -- id: %d rate: %d, limit: %d, len: %d, ft: %lld \n",
+            PRINT_INFO_ARGS("class -- id: %d rate: %d, limit: %d, len: %d, ft: %llu acitve: %d\n",
                             it->common.classid, it->rate, it->limit, it->queue->q.qlen,
-                            it->ft);
+                            it->ft, it->is_active);
 #endif
-            // Only for queues that are not empty.
-            if (it->queue->q.qlen > 0) {
-                cl = it->ft > ft ? cl : it;
-                ft = it->ft;
+           // Only for queues that are not empty.
+            if (it->is_active) {
+				struct sk_buff *skb = it->queue->ops->peek(it->queue);
+				if (skb != NULL) {
+    				if (ft > skb->tstamp) {
+						cl = it;
+						ft = skb->tstamp;
+    				}
+				} else {
+					PRINT_INFO("W-w-w-whaat?");
+				}
             }
         }
     }
+    return cl;
+}
+    
+static struct sk_buff *
+cbwfq_peek(struct Qdisc *sch)
+{
+    struct cbwfq_sched_data *q = qdisc_priv(sch);
+    struct cbwfq_class *cl = NULL;
+
+    cl = cbwfq_find_min(q);
     if (cl == NULL) {
         return NULL;
     }
-
-#ifdef PRINT_CALLS
-    PRINT_INFO_ARGS("out class -- id: %d", cl->common.classid);
-#endif
-
-    return cl->queue->ops->dequeue(cl->queue);
-
-#if 0
-    for (i = 0; i < q->clhash.hashsize; i++) {
-        hlist_for_each_entry(it, &q->clhash.hash[i], common.hnode) {
-            struct sk_buff *skb = it->queue->ops->peek(it->queue);
-            if (skb) {
-#ifdef PRINT_CALLS
-                PRINT_INFO("end");
-#endif
-                return skb;
-            }
-        }
-    }
-
-#ifdef PRINT_CALLS
-    PRINT_INFO("end null");
-#endif
-    return NULL;
-#endif
+    return cl->queue->ops->peek(cl->queue);
 }
 
 static struct sk_buff *
 cbwfq_dequeue(struct Qdisc *sch)
 {
     struct cbwfq_sched_data *q = qdisc_priv(sch);
-    struct cbwfq_class *it, *cl = NULL;
-    struct sk_buff *skb, *skb_next;
-    int i;
-    ktime_t ft = KTIME_MAX;
-#ifdef PRINT_CALLS
-    PRINT_INFO("begin");
-#endif
+    struct cbwfq_class *cl = NULL;
+    struct sk_buff *skb;
 
-    // Find class with min finish time. 
-    for (i = 0; i < q->clhash.hashsize; i++) {
-        hlist_for_each_entry(it, &q->clhash.hash[i], common.hnode) {
-#ifdef PRINT_CALLS
-            PRINT_INFO_ARGS("class -- id: %d rate: %d, limit: %d, len: %d, ft: %lld \n",
-                            it->common.classid, it->rate, it->limit, it->queue->q.qlen,
-                            it->ft);
-#endif
-            // Only for queues that are not empty.
-            if (it->queue->q.qlen > 0) {
-                cl = it->ft > ft ? cl : it;
-                ft = it->ft;
-            }
-        }
-    }
-    if (cl == NULL) {
+    if (q->active_rate == 0) {
         return NULL;
     }
 
+    cl = cbwfq_find_min(q);
+    if (cl == NULL) {
+        return NULL;
+    }
 #ifdef PRINT_CALLS
     PRINT_INFO_ARGS("out class -- id: %d", cl->common.classid);
 #endif
@@ -483,24 +423,24 @@ cbwfq_dequeue(struct Qdisc *sch)
         return NULL;
     }
 
+	q->sch_sn = skb->tstamp;
+
+	PRINT_INFO_ARGS("%llu from %u\n", skb->tstamp, cl->common.classid);
     qdisc_bstats_update(sch, skb);
     qdisc_qstats_backlog_dec(sch, skb);
+    qdisc_qstats_backlog_dec(cl->queue, skb);
     sch->q.qlen--;
 
-    // Save final time and evaluate a new one.
-    skb_next = cl->queue->ops->peek(cl->queue);
-    if (skb_next != NULL) {
-        cl->prev_ft = cl->ft;
-        cl->ft = eval_finish_time(sch, cl, skb_next);
-    } else {
-        cl->ft = 0;
-        cl->prev_ft = 0;
+    if (cl->queue->q.qlen == 0) {
+        cl->is_active   = false;
+        q->active_rate -= cl->rate;
+        cl->cl_sn = 0;
     }
 
-#ifdef PRINT_CALLS
-    PRINT_INFO_ARGS("end: classid: %u -- %d:%d", cl->common.classid,
-                    TC_H_MAJ(cl->common.classid) << 16, TC_H_MIN(cl->common.classid));
-#endif
+//    if (q->active_rate == 0) {
+//		q->sch_sn = 0;
+//    }
+
     return skb;
 }
 
@@ -511,6 +451,7 @@ cbwfq_reset(struct Qdisc *sch)
     struct cbwfq_sched_data *q = qdisc_priv(sch);
     struct cbwfq_class *it;
 
+	q->sch_sn = 0;
     for (i = 0; i < q->clhash.hashsize; i++) {
         hlist_for_each_entry(it, &q->clhash.hash[i], common.hnode) {
             //printk(KERN_ALERT" cbwfq: %s: classid: %d, prio %d, q %p", __FUNCTION__,
@@ -544,51 +485,51 @@ cbwfq_destroy(struct Qdisc *sch)
     }
     qdisc_class_hash_destroy(&q->clhash);
 }
+
 static int
 cbwfq_change(struct Qdisc *sch, struct nlattr *opt)
 {
     struct cbwfq_sched_data *q = qdisc_priv(sch);
     struct tc_cbwfq_glob *qopt;
     struct nlattr *tb[TCA_CBWFQ_MAX + 1];
-    int err = -EINVAL;
+    int err;
 
 #ifdef PRINT_CALLS
     PRINT_INFO("begins");
 #endif
     if (opt == NULL) {
-        goto failure;
+        return -EINVAL;
     }
 
     err = nla_parse_nested(tb, TCA_CBWFQ_MAX, opt, cbwfq_policy, NULL);
     if (err < 0) {
-        goto failure;
+        return err;
     }
 
-    err = -EINVAL;
     if (tb[TCA_CBWFQ_INIT] == NULL) {
-        goto failure;
+        return -EINVAL;
     }
 
     qopt = nla_data(tb[TCA_CBWFQ_INIT]);
 
     sch_tree_lock(sch);
 
-    if (qopt->cbwfq_gl_default_limit > 0)
+    if (qopt->cbwfq_gl_default_limit > 0) {
         q->default_queue->limit = qopt->cbwfq_gl_default_limit;
+    }
 
-    if (qopt->cbwfq_gl_default_weight > 0)
-        q->default_queue->weight = qopt->cbwfq_gl_default_weight;
-
-	q->used_by_cl_weight = 0;
-	q->default_queue->weight = FULL_WEIGHT;
+	if (qopt->cbwfq_gl_rate_type == TCA_CBWFQ_RT_BYTE) {
+        q->default_queue->rate  = qopt->cbwfq_gl_default_rate;
+	} else {
+        q->default_queue->rate  = qopt->cbwfq_gl_default_rate * q->ifrate / 100;
+	}
 
     sch_tree_unlock(sch);
 #ifdef PRINT_CALLS
     PRINT_INFO("and all is okay!");
 #endif
     return 0;
-failure:
-    return err;
+
 }
 
 static int
@@ -616,6 +557,9 @@ cbwfq_init(struct Qdisc *sch, struct nlattr *opt)
     if (err < 0)
         return err;
 
+    q->active_rate = 0;
+    q->sch_sn      = 0;
+
     /* Init default queue. */
     cl = kmalloc( sizeof(struct cbwfq_class), GFP_KERNEL);
     if (cl == NULL) {
@@ -625,10 +569,10 @@ cbwfq_init(struct Qdisc *sch, struct nlattr *opt)
 
     /* Set classid for default class. */
     cl->common.classid = TC_H_MAKE(1 << 16, 1);
-    cl->prev_ft = 0;
-    cl->ft      = 0;
-    cl->limit   = 0;
-    cl->weight  = FULL_WEIGHT;
+    cl->limit   = 1024;
+    cl->rate  = 0;
+    cl->is_active = false;
+	cl->cl_sn = 0;
 
     err = nla_parse_nested(tb, TCA_CBWFQ_MAX, opt, cbwfq_policy, NULL);
     if (err < 0)
@@ -640,11 +584,16 @@ cbwfq_init(struct Qdisc *sch, struct nlattr *opt)
         PRINT_INFO_ARGS("Default queue limit: %d", qopt->cbwfq_gl_default_limit);
         cl->limit = qopt->cbwfq_gl_default_limit;
     }
-    if (qopt->cbwfq_gl_default_weight != 0) {
-        cl->weight = qopt->cbwfq_gl_default_weight;
-    }
 
-    PRINT_INFO_ARGS("Default weight: %d", cl->weight);
+	q->ifrate = qopt->cbwfq_gl_total_rate;
+
+	if (qopt->cbwfq_gl_rate_type == TCA_CBWFQ_RT_BYTE) {
+        cl->rate  = qopt->cbwfq_gl_default_rate;
+	} else {
+        cl->rate = (qopt->cbwfq_gl_default_rate * q->ifrate) / 100;
+	}
+
+    PRINT_INFO_ARGS("Default rate: %d; Total Rate: %d Opt rate: %d\n", cl->rate, q->ifrate, qopt->cbwfq_gl_default_rate);
 
     sch_tree_lock(sch);
     cbwfq_add_class(sch, cl);
@@ -653,7 +602,6 @@ cbwfq_init(struct Qdisc *sch, struct nlattr *opt)
     return 0;
 }
 
-#if 0
 static int
 cbwfq_dump(struct Qdisc *sch, struct sk_buff *skb)
 {
@@ -667,7 +615,7 @@ cbwfq_dump(struct Qdisc *sch, struct sk_buff *skb)
 #endif
 
     memset(&opt, 0, sizeof(opt));
-    opt.cbwfq_gl_if_bandwidth = q->if_bandwidth; 
+    opt.cbwfq_gl_total_rate = q->ifrate; 
 
     nest = nla_nest_start(skb, TCA_OPTIONS);
     if (nest == NULL)
@@ -682,7 +630,6 @@ nla_put_failure:
     nlmsg_trim(skb, b);
     return -1;
 }
-#endif
 
 static int
 cbwfq_graft(struct Qdisc *sch, unsigned long arg, struct Qdisc *new,
@@ -760,7 +707,7 @@ cbwfq_dump_class(struct Qdisc *sch, unsigned long cl,
 
     memset(&opt, 0, sizeof(opt));
     opt.cbwfq_cl_limit  = c->limit;
-    opt.cbwfq_cl_weight = c->weight;
+    opt.cbwfq_cl_rate = c->rate;
 
     if (nla_put(skb, TCA_CBWFQ_PARAMS, sizeof(opt), &opt))
         goto failure;
@@ -844,6 +791,8 @@ static const struct Qdisc_class_ops cbwfq_class_ops = {
     .walk       =   cbwfq_walk,
     /* Change class. */
     .change     =   cbwfq_change_class,
+    /* Delete class. */
+    .delete     =   cbwfq_delete_class,
     /* */
     .tcf_block  =   cbwfq_tcf_block,
     /* Binds an instance of a filter to the class. */
@@ -880,7 +829,7 @@ static struct Qdisc_ops cbwfq_qdisc_ops __read_mostly = {
     /* Changes values of the parameters of a qdisc. */
     .change     =   cbwfq_change,
     /* Shows statistics of the queuing discipline. */
-    //.dump       =   cbwfq_dump,
+    .dump       =   cbwfq_dump,
     .owner      =   THIS_MODULE,
 };
 
