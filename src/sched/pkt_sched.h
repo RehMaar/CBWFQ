@@ -967,15 +967,22 @@ enum {
     __TCA_CBWFQ_MAX
 };
 #define TCA_CBWFQ_MAX (__TCA_CBWFQ_MAX - 1)
+enum cbwfq_rate_type {
+    TCA_CBWFQ_RT_BYTE,
+    TCA_CBWFQ_RT_PERCENT
+};
 
 struct tc_cbwfq_glob {
     __u32 cbwfq_gl_default_limit;
-    __u32 cbwfq_gl_default_weight;
+    __u32 cbwfq_gl_default_rate;
+    __u32 cbwfq_gl_total_rate;
+    enum cbwfq_rate_type cbwfq_gl_rate_type;
 };
 
 struct tc_cbwfq_copt {
-    __u32 cbwfq_cl_weight;
-    __u32 cbwfq_cl_limit;
+    u64 cbwfq_cl_rate;
+    u64 cbwfq_cl_limit;
+    enum cbwfq_rate_type cbwfq_cl_rate_type;
 };
 
 #endif
