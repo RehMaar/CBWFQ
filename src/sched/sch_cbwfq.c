@@ -34,8 +34,7 @@ struct cbwfq_class {
     u64 limit;
     u64 rate;
 
-	u64 cl_sn;
-
+    u64 cl_sn;
 
     bool is_active;
 };
@@ -61,11 +60,15 @@ struct cbwfq_sched_data {
 
     struct cbwfq_class *default_queue;
 
-	u64 ifrate;
+//    u64 limit;
 
-	u32 active_rate;
+    enum cbwfq_rate_type rtype;
+    u64 ifrate;
+
+    u32 active_rate;
 
     u64 sch_sn;
+	struct qdisc_watchdog watchdog;
 };
 
 
@@ -82,7 +85,7 @@ static const struct nla_policy cbwfq_policy[TCA_CBWFQ_MAX + 1] = {
  * Class is allocate outside.
  */
 static void
-cbwfq_add_class(struct Qdisc *sch, struct cbwfq_class *cl)
+cbwfq_add_class(struct Qdisc *sch, struct cbwfq_class *cl, struct netlink_ext_ack *extack)
 {
     struct cbwfq_sched_data *q = qdisc_priv(sch);
 #ifdef PRINT_CALLS
@@ -90,7 +93,7 @@ cbwfq_add_class(struct Qdisc *sch, struct cbwfq_class *cl)
 #endif
 
     cl->queue = qdisc_create_dflt(sch->dev_queue,
-                                  &pfifo_qdisc_ops, cl->common.classid);
+                                  &pfifo_qdisc_ops, cl->common.classid, extack);
     qdisc_class_hash_insert(&q->clhash, &cl->common);
 }
 
@@ -155,18 +158,18 @@ cbwfq_modify_class(struct Qdisc *sch, struct cbwfq_class *cl,
         cl->limit = copt->cbwfq_cl_limit;
     }
 
-	if (copt->cbwfq_cl_rate_type == TCA_CBWFQ_RT_BYTE) {
-        cl->rate  = copt->cbwfq_cl_rate;
-	} else {
-        cl->rate  = copt->cbwfq_cl_rate * q->ifrate;
-        do_div(cl->rate, 100);
-	}
+    if (copt->cbwfq_cl_rate_type != q->rtype) {
+        PRINT_INFO_ARGS("different rate types.");
+        return -EINVAL;
+    }
+    cl->rate = copt->cbwfq_cl_rate;
 
     return 0;
 }
 
 static int
-cbwfq_class_create(struct Qdisc *sch, struct tc_cbwfq_copt *copt, unsigned long classid)
+cbwfq_class_create(struct Qdisc *sch, struct tc_cbwfq_copt *copt, unsigned long classid,
+                   struct netlink_ext_ack *extack)
 {
     struct cbwfq_class *cl;
     struct cbwfq_sched_data *q = qdisc_priv(sch);
@@ -180,7 +183,7 @@ cbwfq_class_create(struct Qdisc *sch, struct tc_cbwfq_copt *copt, unsigned long 
     cl->limit   = 1024;
     cl->rate  = 0;
     cl->is_active = false;
-	cl->cl_sn = 0;
+    cl->cl_sn = 0;
 
     if (cbwfq_modify_class(sch, cl, copt) != 0) {
         kfree(cl);
@@ -188,7 +191,7 @@ cbwfq_class_create(struct Qdisc *sch, struct tc_cbwfq_copt *copt, unsigned long 
     }
 
     sch_tree_lock(sch);
-        cbwfq_add_class(sch, cl);
+        cbwfq_add_class(sch, cl, extack);
     sch_tree_unlock(sch);
 
     PRINT_INFO_ARGS("classid: %ld:%ld (%ld)\n", TC_H_MAJ(classid) >> 16,
@@ -200,7 +203,7 @@ cbwfq_class_create(struct Qdisc *sch, struct tc_cbwfq_copt *copt, unsigned long 
 
 static int
 cbwfq_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
-                   struct nlattr **tca, unsigned long *arg)
+                   struct nlattr **tca, unsigned long *arg, struct netlink_ext_ack *extack)
 {
     struct cbwfq_sched_data *q = qdisc_priv(sch);
     struct cbwfq_class *cl;
@@ -233,7 +236,7 @@ cbwfq_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
     if (cl != NULL) {
         return cbwfq_modify_class(sch, cl, copt);
     }
-    return cbwfq_class_create(sch, copt, classid);
+    return cbwfq_class_create(sch, copt, classid, extack);
 }
 
 
@@ -299,7 +302,7 @@ cbwfq_classify(struct sk_buff *skb, struct Qdisc *sch, int *qerr)
 
     return cl;
 }
-   
+
 static int
 cbwfq_enqueue(struct sk_buff *skb, struct Qdisc *sch, struct sk_buff **to_free)
 {
@@ -315,7 +318,7 @@ cbwfq_enqueue(struct sk_buff *skb, struct Qdisc *sch, struct sk_buff **to_free)
         __qdisc_drop(skb, to_free);
         return ret;
     }
-
+,
     if (cl->queue->q.qlen >= cl->limit) {
         if (net_xmit_drop_count(ret)) {
             qdisc_qstats_drop(sch);
@@ -326,18 +329,17 @@ cbwfq_enqueue(struct sk_buff *skb, struct Qdisc *sch, struct sk_buff **to_free)
     qdisc = cl->queue;
     ret = qdisc_enqueue(skb, qdisc, to_free);
     if (ret == NET_XMIT_SUCCESS) {
-       u32 virtual_len = qdisc_pkt_len(skb) * q->ifrate;
-       do_div(virtual_len, cl->rate);
+      u32 virtual_len = qdisc_pkt_len(skb) * (q->ifrate / cl->rate);
         if (!cl->is_active) {
            cl->cl_sn = skb->tstamp = q->sch_sn + virtual_len;
            cl->is_active    = true;
            q->active_rate += cl->rate;
         } else {
             cl->cl_sn += virtual_len; //qdisc_pkt_len(skb) * q->ifrate / cl->rate;
-			skb->tstamp = cl->cl_sn;
+            skb->tstamp = cl->cl_sn;
         }
 
-		PRINT_INFO_ARGS("%llu to %u\n", skb->tstamp, cl->common.classid);
+    PRINT_INFO_ARGS("sch_qlen: %d qlen: %d, %llu to %u\n", sch->q.qlen, cl->queue->q.qlen, skb->tstamp, cl->common.classid);
 
         /* Evaluate Finish time for each packet at arrival. */
         sch->q.qlen++;
@@ -350,7 +352,6 @@ cbwfq_enqueue(struct sk_buff *skb, struct Qdisc *sch, struct sk_buff **to_free)
         qdisc_qstats_drop(sch);
         qdisc_qstats_drop(cl->queue);
     }
-
     return ret;
 }
 
@@ -371,15 +372,15 @@ cbwfq_find_min(struct cbwfq_sched_data *q)
 #endif
            // Only for queues that are not empty.
             if (it->is_active) {
-				struct sk_buff *skb = it->queue->ops->peek(it->queue);
-				if (skb != NULL) {
-    				if (ft > skb->tstamp) {
-						cl = it;
-						ft = skb->tstamp;
-    				}
-				} else {
-					PRINT_INFO("W-w-w-whaat?");
-				}
+                struct sk_buff *skb = it->queue->ops->peek(it->queue);
+                if (skb != NULL) {
+                    if (ft > skb->tstamp) {
+                        cl = it;
+                        ft = skb->tstamp;
+                    }
+                } else {
+                    PRINT_INFO("W-w-w-whaat?");
+                }
             }
         }
     }
@@ -423,24 +424,23 @@ cbwfq_dequeue(struct Qdisc *sch)
         return NULL;
     }
 
-	q->sch_sn = skb->tstamp;
-
-	PRINT_INFO_ARGS("%llu from %u\n", skb->tstamp, cl->common.classid);
     qdisc_bstats_update(sch, skb);
     qdisc_qstats_backlog_dec(sch, skb);
     qdisc_qstats_backlog_dec(cl->queue, skb);
     sch->q.qlen--;
 
     if (cl->queue->q.qlen == 0) {
-        cl->is_active   = false;
+        cl->is_active = false;
+        cl->cl_sn     = 0;
         q->active_rate -= cl->rate;
-        cl->cl_sn = 0;
     }
 
-//    if (q->active_rate == 0) {
-//		q->sch_sn = 0;
-//    }
-
+    PRINT_INFO_ARGS("sch_qlen: %d qlen: %d, %llu to %u\n", sch->q.qlen, cl->queue->q.qlen, skb->tstamp, cl->common.classid);
+    if (q->active_rate == 0) {
+        q->sch_sn = 0;
+    } else {
+        q->sch_sn = skb->tstamp;
+    }
     return skb;
 }
 
@@ -451,7 +451,7 @@ cbwfq_reset(struct Qdisc *sch)
     struct cbwfq_sched_data *q = qdisc_priv(sch);
     struct cbwfq_class *it;
 
-	q->sch_sn = 0;
+    q->sch_sn = 0;
     for (i = 0; i < q->clhash.hashsize; i++) {
         hlist_for_each_entry(it, &q->clhash.hash[i], common.hnode) {
             //printk(KERN_ALERT" cbwfq: %s: classid: %d, prio %d, q %p", __FUNCTION__,
@@ -483,11 +483,12 @@ cbwfq_destroy(struct Qdisc *sch)
             }
         }
     }
+	qdisc_watchdog_cancel(&q->watchdog);
     qdisc_class_hash_destroy(&q->clhash);
 }
 
 static int
-cbwfq_change(struct Qdisc *sch, struct nlattr *opt)
+cbwfq_change(struct Qdisc *sch, struct nlattr *opt, struct netlink_ext_ack *extack)
 {
     struct cbwfq_sched_data *q = qdisc_priv(sch);
     struct tc_cbwfq_glob *qopt;
@@ -518,11 +519,7 @@ cbwfq_change(struct Qdisc *sch, struct nlattr *opt)
         q->default_queue->limit = qopt->cbwfq_gl_default_limit;
     }
 
-	if (qopt->cbwfq_gl_rate_type == TCA_CBWFQ_RT_BYTE) {
-        q->default_queue->rate  = qopt->cbwfq_gl_default_rate;
-	} else {
-        q->default_queue->rate  = qopt->cbwfq_gl_default_rate * q->ifrate / 100;
-	}
+    /* Could only change limit. TODO: fix tc. */
 
     sch_tree_unlock(sch);
 #ifdef PRINT_CALLS
@@ -533,7 +530,7 @@ cbwfq_change(struct Qdisc *sch, struct nlattr *opt)
 }
 
 static int
-cbwfq_init(struct Qdisc *sch, struct nlattr *opt)
+cbwfq_init(struct Qdisc *sch, struct nlattr *opt, struct netlink_ext_ack *extack)
 {
     struct cbwfq_sched_data *q = qdisc_priv(sch);
     struct cbwfq_class *cl;
@@ -548,7 +545,7 @@ cbwfq_init(struct Qdisc *sch, struct nlattr *opt)
         return -EINVAL;
 
     /* Init filter system. */
-    err = tcf_block_get(&q->block, &q->filter_list, sch);
+    err = tcf_block_get(&q->block, &q->filter_list, sch, extack);
     if (err)
         return err;
 
@@ -557,6 +554,7 @@ cbwfq_init(struct Qdisc *sch, struct nlattr *opt)
     if (err < 0)
         return err;
 
+    //q->limit = qdisc_dev(sch)->tx_queue_len;
     q->active_rate = 0;
     q->sch_sn      = 0;
 
@@ -572,7 +570,7 @@ cbwfq_init(struct Qdisc *sch, struct nlattr *opt)
     cl->limit   = 1024;
     cl->rate  = 0;
     cl->is_active = false;
-	cl->cl_sn = 0;
+    cl->cl_sn = 0;
 
     err = nla_parse_nested(tb, TCA_CBWFQ_MAX, opt, cbwfq_policy, NULL);
     if (err < 0)
@@ -585,20 +583,24 @@ cbwfq_init(struct Qdisc *sch, struct nlattr *opt)
         cl->limit = qopt->cbwfq_gl_default_limit;
     }
 
-	q->ifrate = qopt->cbwfq_gl_total_rate;
 
-	if (qopt->cbwfq_gl_rate_type == TCA_CBWFQ_RT_BYTE) {
+    if (qopt->cbwfq_gl_rate_type == TCA_CBWFQ_RT_BYTE) {
+        q->rtype  = TCA_CBWFQ_RT_BYTE;
+        q->ifrate = qopt->cbwfq_gl_total_rate;
         cl->rate  = qopt->cbwfq_gl_default_rate;
-	} else {
-        cl->rate = (qopt->cbwfq_gl_default_rate * q->ifrate) / 100;
-	}
+    } else {
+        q->rtype  = TCA_CBWFQ_RT_PERCENT;
+        q->ifrate = 100;
+        cl->rate  = qopt->cbwfq_gl_default_rate;
+    }
+
 
     PRINT_INFO_ARGS("Default rate: %d; Total Rate: %d Opt rate: %d\n", cl->rate, q->ifrate, qopt->cbwfq_gl_default_rate);
 
     sch_tree_lock(sch);
-    cbwfq_add_class(sch, cl);
+    cbwfq_add_class(sch, cl, extack);
     sch_tree_unlock(sch);
-
+	qdisc_watchdog_init(&q->watchdog, sch);
     return 0;
 }
 
@@ -633,7 +635,7 @@ nla_put_failure:
 
 static int
 cbwfq_graft(struct Qdisc *sch, unsigned long arg, struct Qdisc *new,
-            struct Qdisc **old)
+            struct Qdisc **old, struct netlink_ext_ack *extack)
 {
     struct cbwfq_sched_data *q = qdisc_priv(sch);
     struct cbwfq_class *cl;
@@ -771,7 +773,7 @@ cbwfq_walk(struct Qdisc *sch, struct qdisc_walker *arg)
 }
 
 static struct tcf_block *
-cbwfq_tcf_block(struct Qdisc *sch, unsigned long cl)
+cbwfq_tcf_block(struct Qdisc *sch, unsigned long cl, struct netlink_ext_ack *extack)
 {
     struct cbwfq_sched_data *q = qdisc_priv(sch);
 #ifdef PRINT_CALLS

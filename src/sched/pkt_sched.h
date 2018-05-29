@@ -980,8 +980,8 @@ struct tc_cbwfq_glob {
 };
 
 struct tc_cbwfq_copt {
-    u64 cbwfq_cl_rate;
-    u64 cbwfq_cl_limit;
+    __u32 cbwfq_cl_rate;
+    __u32 cbwfq_cl_limit;
     enum cbwfq_rate_type cbwfq_cl_rate_type;
 };
 

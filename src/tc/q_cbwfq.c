@@ -24,8 +24,8 @@
 
 static void explain(void)
 {
-    fprintf(stderr, "Usage: ... qdisc add .. cbwfq bandwidth B [default limit L rate R]\n"
-            "\tbandwidth 		  bandwidth of the link (in Kbps)\n"
+    fprintf(stderr, "Usage: ... qdisc add .. cbwfq bandwidth B default rate R [limit L] \n"
+            "\tbandwidth 		  bandwidth of the link (Mbps, Kbps, bps)\n"
             "\tdefault            configuration for default class (see desciption below)\n"
             "... class add ... cbwfq rate R [limit L]\n"
             "\trate R [percent] 	  rate of the class in Kbit; to use percent and keywork `percent'\n"
@@ -50,21 +50,11 @@ static int cbwfq_parse_opt(struct qdisc_util *qu, int argc, char **argv,
     while (argc > 0) {
         if (matches(*argv, "default") == 0) {
             NEXT_ARG();
-            if (matches(*argv, "limit") == 0) {
-                NEXT_ARG();
-                if (get_u32(&opt.cbwfq_gl_default_limit, *argv, 10)) {
-                    explain1("limit");
-                    return -1;
-                }
-                argc--; argv++;
-            }
 
-            if (argc <= 0) {
-                    break;
-            } else if (matches(*argv, "rate") == 0) {
+            if (matches(*argv, "rate") == 0) {
 				NEXT_ARG();
                 if (get_rate(&opt.cbwfq_gl_default_rate, *argv)) {
-                    explain1("rate");
+                    explain1("rate is illegal");
                     return -1;
                 }
     			argv++; argc--;
@@ -80,6 +70,14 @@ static int cbwfq_parse_opt(struct qdisc_util *qu, int argc, char **argv,
                     argv++;
                 } else {
                     opt.cbwfq_gl_rate_type = TCA_CBWFQ_RT_BYTE;
+                }
+            }
+
+            if (matches(*argv, "limit") == 0) {
+                NEXT_ARG();
+                if (get_u32(&opt.cbwfq_gl_default_limit, *argv, 10)) {
+                    explain1("limit");
+                    return -1;
                 }
             } else {
                 fprintf(stderr, "Unknown default parameter: \"%s\".\n", *argv);
@@ -122,7 +120,7 @@ static int cbwfq_parse_class_opt(struct qdisc_util *qu, int argc, char **argv,
 {
     struct tc_cbwfq_copt opt;
     struct rtattr *tail;
-
+    
     memset(&opt, 0, sizeof(opt));
     while (argc > 0) {
         if (matches(*argv, "rate") == 0) {
@@ -162,6 +160,7 @@ static int cbwfq_parse_class_opt(struct qdisc_util *qu, int argc, char **argv,
         }
         argc--; argv++;
     }
+
 
     if (opt.cbwfq_cl_rate <= 0) {
         fprintf(stderr, "Rate must be set.\n");
