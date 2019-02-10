@@ -1,1 +1,4 @@
-#CBWFQ implementation in linux
+CBWFQ
+-----
+
+Attempt to implement CBWFQ packet scheduling algorithm in Linux kernel.
